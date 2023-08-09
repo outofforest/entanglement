@@ -26,13 +26,16 @@ const (
 	maxDedupSize = 1000
 )
 
+// MessageHandler defines the function handling received messages.
 type MessageHandler func(ctx context.Context, msg []byte, hash [sha256.Size]byte) error
 
+// PeerIO specifies the interface required from connected peers.
 type PeerIO interface {
 	io.ReadCloser
 	io.ReaderFrom
 }
 
+// Entanglement broadcasts messages between peers.
 type Entanglement struct {
 	peerCh     <-chan PeerIO
 	sendCh     <-chan []byte
@@ -41,6 +44,7 @@ type Entanglement struct {
 	dedup      *dedupCache
 }
 
+// New creates new entanglement.
 func New(
 	peerCh <-chan PeerIO,
 	sendCh <-chan []byte,
@@ -55,10 +59,12 @@ func New(
 	}
 }
 
+// ClearCache removes hash from the deduplication cache.
 func (e *Entanglement) ClearCache(hash [sha256.Size]byte) {
 	e.dedup.Remove(hash)
 }
 
+// Run runs the entanglement.
 func (e *Entanglement) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
 		spawn("broadcast", parallel.Fail, func(ctx context.Context) error {
