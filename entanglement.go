@@ -2,7 +2,6 @@ package entanglement
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/outofforest/logger"
 	"github.com/outofforest/parallel"
 	"github.com/outofforest/spin"
@@ -27,7 +27,7 @@ const (
 )
 
 // MessageHandler defines the function handling received messages.
-type MessageHandler func(ctx context.Context, msg []byte, hash [sha256.Size]byte) error
+type MessageHandler func(ctx context.Context, msg []byte, hash uint64) error
 
 // PeerIO specifies the interface required from connected peers.
 type PeerIO interface {
@@ -60,7 +60,7 @@ func New(
 }
 
 // ClearCache removes hash from the deduplication cache.
-func (e *Entanglement) ClearCache(hash [sha256.Size]byte) {
+func (e *Entanglement) ClearCache(hash uint64) {
 	e.dedup.Remove(hash)
 }
 
@@ -125,7 +125,7 @@ func newPeer(
 	return &peer{
 		peerIO:         peerIO,
 		readerPipeline: newPeerReaderPipeline(peerID, peerIO, msgHandler, peers, dedup, pingCount),
-		writerPipeline: newPeerWriterPipeline(peerIO, sendCh, pingCount),
+		writerPipeline: newPeerWriterPipeline(peerID, peerIO, sendCh, pingCount),
 	}
 }
 
@@ -179,10 +179,11 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 			messageBufferPool <- make([]byte, 4096)
 		}
 
-		ch01To02 := make(chan receivedMessage, 1)
-		ch02To03 := make(chan receivedMessage, 1)
-		ch03To04 := make(chan receivedMessage, 1)
-		ch04To05 := make(chan receivedMessage, 1)
+		ch01To02 := make(chan receivedMessage, 10)
+		ch02To03 := make(chan receivedMessage, 10)
+		ch03To04 := make(chan receivedMessage, 10)
+		ch04To05 := make(chan receivedMessage, 10)
+		ch05To06 := make(chan receivedMessage, 10)
 
 		spawn("closer", parallel.Fail, func(ctx context.Context) error {
 			<-ctx.Done()
@@ -207,7 +208,7 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				}
 			}
 		})
-		spawn("step02DedupMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step02HashMessages", parallel.Fail, func(ctx context.Context) error {
 			var msg receivedMessage
 
 			for {
@@ -217,17 +218,14 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				case msg = <-ch01To02:
 				}
 
-				msg, ok := prp.step02DedupMessage(msg, messageBufferPool)
-				if ok {
-					select {
-					case <-ctx.Done():
-						return errors.WithStack(ctx.Err())
-					case ch02To03 <- msg:
-					}
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case ch02To03 <- prp.step02HashMessage(msg):
 				}
 			}
 		})
-		spawn("step03CopyMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step03DedupMessages", parallel.Fail, func(ctx context.Context) error {
 			var msg receivedMessage
 
 			for {
@@ -237,17 +235,19 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				case msg = <-ch02To03:
 				}
 
-				msg.Buffer = prp.step03CopyMessage(msg, messageBufferPool)
-
-				select {
-				case <-ctx.Done():
-					return errors.WithStack(ctx.Err())
-				case ch03To04 <- msg:
+				msg, ok := prp.step03DedupMessage(msg, messageBufferPool)
+				if ok {
+					select {
+					case <-ctx.Done():
+						return errors.WithStack(ctx.Err())
+					case ch03To04 <- msg:
+					}
 				}
 			}
 		})
-		spawn("step04BroadcastMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step04CopyMessages", parallel.Fail, func(ctx context.Context) error {
 			var msg receivedMessage
+			var buffer []byte
 
 			for {
 				select {
@@ -256,7 +256,7 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				case msg = <-ch03To04:
 				}
 
-				prp.step04BroadcastMessage(msg.Buffer)
+				msg.Buffer, buffer = prp.step04CopyMessage(msg, buffer, messageBufferPool)
 
 				select {
 				case <-ctx.Done():
@@ -265,7 +265,7 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				}
 			}
 		})
-		spawn("step05HandleMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step05BroadcastMessages", parallel.Fail, func(ctx context.Context) error {
 			var msg receivedMessage
 
 			for {
@@ -275,7 +275,26 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 				case msg = <-ch04To05:
 				}
 
-				if err := prp.step05HandleMessage(ctx, msg.Buffer, msg.Hash); err != nil {
+				prp.step05BroadcastMessage(msg.Buffer)
+
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case ch05To06 <- msg:
+				}
+			}
+		})
+		spawn("step06HandleMessages", parallel.Fail, func(ctx context.Context) error {
+			var msg receivedMessage
+
+			for {
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case msg = <-ch05To06:
+				}
+
+				if err := prp.step06HandleMessage(ctx, msg.Buffer, msg.Hash); err != nil {
 					return err
 				}
 			}
@@ -310,17 +329,15 @@ func (prp *peerReaderPipeline) step01ReceiveMessage(ctx context.Context, r step0
 	case <-ctx.Done():
 		return receivedMessage{}, false, errors.WithStack(ctx.Err())
 	case messageBuffer = <-messageBufferPool:
+		if uint64(len(messageBuffer)) < msgSize {
+			messageBuffer = make([]byte, msgSize)
+		}
 	}
-
 	defer func() {
 		if !retOK {
 			messageBufferPool <- messageBuffer
 		}
 	}()
-
-	if uint64(len(messageBuffer)) < msgSize {
-		messageBuffer = make([]byte, msgSize)
-	}
 
 	var nTotal uint64
 	for nTotal < msgSize {
@@ -337,9 +354,12 @@ func (prp *peerReaderPipeline) step01ReceiveMessage(ctx context.Context, r step0
 	}, true, nil
 }
 
-func (prp *peerReaderPipeline) step02DedupMessage(msg receivedMessage, messageBufferPool chan []byte) (receivedMessage, bool) {
-	msg.Hash = sha256.Sum256(msg.Buffer[:msg.Size])
+func (prp *peerReaderPipeline) step02HashMessage(msg receivedMessage) receivedMessage {
+	msg.Hash = xxhash.Sum64(msg.Buffer[:msg.Size])
+	return msg
+}
 
+func (prp *peerReaderPipeline) step03DedupMessage(msg receivedMessage, messageBufferPool chan []byte) (receivedMessage, bool) {
 	if prp.dedup.Check(msg.Hash) {
 		messageBufferPool <- msg.Buffer
 		return receivedMessage{}, false
@@ -348,25 +368,27 @@ func (prp *peerReaderPipeline) step02DedupMessage(msg receivedMessage, messageBu
 	return msg, true
 }
 
-func (prp *peerReaderPipeline) step03CopyMessage(msg receivedMessage, messageBufferPool chan []byte) []byte {
-	buf := make([]byte, msg.Size)
-	copy(buf, msg.Buffer)
+func (prp *peerReaderPipeline) step04CopyMessage(msg receivedMessage, buffer []byte, messageBufferPool chan []byte) ([]byte, []byte) {
+	if uint64(len(buffer)) < msg.Size {
+		buffer = make([]byte, 2*maxMsgSize)
+	}
+	copy(buffer, msg.Buffer[:msg.Size])
 
 	messageBufferPool <- msg.Buffer
 
-	return buf
+	return buffer[:msg.Size], buffer[msg.Size:]
 }
 
-func (prp *peerReaderPipeline) step04BroadcastMessage(msg []byte) {
+func (prp *peerReaderPipeline) step05BroadcastMessage(msg []byte) {
 	prp.peers.Broadcast(prp.peerID, msg)
 }
 
-func (prp *peerReaderPipeline) step05HandleMessage(ctx context.Context, msg []byte, hash [sha256.Size]byte) error {
-	prp.peers.Broadcast(prp.peerID, msg)
+func (prp *peerReaderPipeline) step06HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
 	return prp.msgHandler(ctx, msg, hash)
 }
 
 type peerWriterPipeline struct {
+	peerID peerID
 	peerIO PeerIO
 	sendCh <-chan []byte
 
@@ -374,11 +396,13 @@ type peerWriterPipeline struct {
 }
 
 func newPeerWriterPipeline(
+	peerID peerID,
 	peerIO PeerIO,
 	sendCh <-chan []byte,
 	pingCount *uint64,
 ) *peerWriterPipeline {
 	return &peerWriterPipeline{
+		peerID:    peerID,
 		peerIO:    peerIO,
 		sendCh:    sendCh,
 		pingCount: pingCount,
@@ -502,27 +526,39 @@ func (ps *peerSet) Broadcast(senderID peerID, msg []byte) {
 
 type dedupCache struct {
 	mu     sync.RWMutex
-	dedup1 map[[sha256.Size]byte]struct{}
-	dedup2 map[[sha256.Size]byte]struct{}
+	dedup1 map[uint64]struct{}
+	dedup2 map[uint64]struct{}
 }
 
 func newDedupCache() *dedupCache {
 	return &dedupCache{
-		dedup1: make(map[[sha256.Size]byte]struct{}, maxDedupSize),
-		dedup2: make(map[[sha256.Size]byte]struct{}, maxDedupSize),
+		dedup1: make(map[uint64]struct{}, maxDedupSize),
+		dedup2: make(map[uint64]struct{}, maxDedupSize),
 	}
 }
 
-func (dc *dedupCache) Check(hash [sha256.Size]byte) bool {
+func (dc *dedupCache) Check(hash uint64) bool {
+	exists := func() bool {
+		dc.mu.RLock()
+		defer dc.mu.RUnlock()
+
+		_, exists := dc.dedup1[hash]
+		return exists
+	}()
+	if exists {
+		return true
+	}
+
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
 	if _, exists := dc.dedup1[hash]; exists {
 		return true
 	}
+
 	if len(dc.dedup1) == maxDedupSize {
 		dc.dedup1 = dc.dedup2
-		dc.dedup2 = make(map[[sha256.Size]byte]struct{}, maxDedupSize)
+		dc.dedup2 = make(map[uint64]struct{}, maxDedupSize)
 	}
 	dc.dedup1[hash] = struct{}{}
 	if len(dc.dedup1) > maxDedupSize/2 {
@@ -532,7 +568,7 @@ func (dc *dedupCache) Check(hash [sha256.Size]byte) bool {
 	return false
 }
 
-func (dc *dedupCache) Remove(hash [sha256.Size]byte) {
+func (dc *dedupCache) Remove(hash uint64) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
@@ -543,7 +579,7 @@ func (dc *dedupCache) Remove(hash [sha256.Size]byte) {
 type receivedMessage struct {
 	Buffer []byte
 	Size   uint64
-	Hash   [sha256.Size]byte
+	Hash   uint64
 }
 
 type step01Reader interface {

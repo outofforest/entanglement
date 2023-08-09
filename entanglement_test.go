@@ -3,7 +3,6 @@ package entanglement
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"io"
 	"testing"
@@ -86,7 +85,7 @@ func TestThreeSimpleTalkers(t *testing.T) {
 	peerCh <- peer3
 
 	receivedCh := make(chan []byte, 6)
-	e := New(peerCh, nil, func(ctx context.Context, msg []byte, hash [sha256.Size]byte) error {
+	e := New(peerCh, nil, func(ctx context.Context, msg []byte, hash uint64) error {
 		receivedCh <- msg
 		return nil
 	})
