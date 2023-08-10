@@ -509,7 +509,6 @@ func (ps *peerSet) Delete(pID peerID) {
 		delete(ps.peers, pID)
 		close(sendCh)
 	}
-
 }
 
 func (ps *peerSet) Broadcast(senderID peerID, msg []byte) {
