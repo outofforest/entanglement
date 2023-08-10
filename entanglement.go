@@ -14,7 +14,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/outofforest/logger"
 	"github.com/outofforest/parallel"
-	"github.com/outofforest/spin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -31,8 +30,10 @@ type MessageHandler func(ctx context.Context, msg []byte, hash uint64) error
 
 // PeerIO specifies the interface required from connected peers.
 type PeerIO interface {
-	io.ReadCloser
-	io.ReaderFrom
+	io.Closer
+	io.Reader
+	io.Writer
+	io.ByteReader
 }
 
 // Entanglement broadcasts messages between peers.
@@ -172,8 +173,6 @@ func newPeerReaderPipeline(
 
 func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
-		readingBuffer := spin.New()
-
 		messageBufferPool := make(chan []byte, 10)
 		for i := 0; i < cap(messageBufferPool); i++ {
 			messageBufferPool <- make([]byte, 4096)
@@ -185,17 +184,9 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 		ch04To05 := make(chan receivedMessage, 10)
 		ch05To06 := make(chan receivedMessage, 10)
 
-		spawn("closer", parallel.Fail, func(ctx context.Context) error {
-			<-ctx.Done()
-			_ = readingBuffer.Close()
-			return errors.WithStack(ctx.Err())
-		})
-		spawn("tapReceiveBytes", parallel.Fail, func(ctx context.Context) error {
-			return prp.tapReceiveBytes(readingBuffer)
-		})
 		spawn("step01ReceiveMessages", parallel.Fail, func(ctx context.Context) error {
 			for {
-				msg, ok, err := prp.step01ReceiveMessage(ctx, readingBuffer, messageBufferPool)
+				msg, ok, err := prp.step01ReceiveMessage(ctx, messageBufferPool)
 				if err != nil {
 					return err
 				}
@@ -303,13 +294,8 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 	})
 }
 
-func (prp *peerReaderPipeline) tapReceiveBytes(r io.ReaderFrom) error {
-	_, err := r.ReadFrom(prp.peerIO)
-	return errors.WithStack(err)
-}
-
-func (prp *peerReaderPipeline) step01ReceiveMessage(ctx context.Context, r step01Reader, messageBufferPool chan []byte) (retRecvMsg receivedMessage, retOK bool, retErr error) {
-	msgSize, err := binary.ReadUvarint(r)
+func (prp *peerReaderPipeline) step01ReceiveMessage(ctx context.Context, messageBufferPool chan []byte) (retRecvMsg receivedMessage, retOK bool, retErr error) {
+	msgSize, err := binary.ReadUvarint(prp.peerIO)
 	if err != nil {
 		return receivedMessage{}, false, errors.WithStack(err)
 	}
@@ -341,7 +327,7 @@ func (prp *peerReaderPipeline) step01ReceiveMessage(ctx context.Context, r step0
 
 	var nTotal uint64
 	for nTotal < msgSize {
-		n, err := r.Read(messageBuffer[nTotal:msgSize])
+		n, err := prp.peerIO.Read(messageBuffer[nTotal:msgSize])
 		if err != nil {
 			return receivedMessage{}, false, err
 		}
@@ -410,69 +396,49 @@ func newPeerWriterPipeline(
 }
 
 func (pwp *peerWriterPipeline) Run(ctx context.Context) error {
-	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
-		writingBuffer := spin.New()
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
 
-		spawn("closer", parallel.Fail, func(ctx context.Context) error {
-			<-ctx.Done()
-			_ = writingBuffer.Close()
+	for {
+		ticker.Reset(pingInterval)
+
+		select {
+		case <-ctx.Done():
 			return errors.WithStack(ctx.Err())
-		})
-		spawn("step01WriteMessages", parallel.Fail, func(ctx context.Context) error {
-			ticker := time.NewTicker(pingInterval)
-			defer ticker.Stop()
-
-			for {
-				ticker.Reset(pingInterval)
-
-				select {
-				case <-ctx.Done():
-					return errors.WithStack(ctx.Err())
-				case msg := <-pwp.sendCh:
-					if err := pwp.step01WriteMessage(writingBuffer, msg); err != nil {
-						return err
-					}
-				case <-ticker.C:
-					if err := pwp.ping(writingBuffer); err != nil {
-						return err
-					}
-				}
+		case msg := <-pwp.sendCh:
+			if err := pwp.step01WriteMessage(msg); err != nil {
+				return err
 			}
-		})
-		spawn("drainWriteBytes", parallel.Fail, func(ctx context.Context) error {
-			return pwp.drainWriteBytes(writingBuffer)
-		})
-		return nil
-	})
+		case <-ticker.C:
+			if err := pwp.ping(); err != nil {
+				return err
+			}
+		}
+	}
 }
 
-func (pwp *peerWriterPipeline) ping(w io.Writer) error {
+func (pwp *peerWriterPipeline) ping() error {
 	prevPing := atomic.AddUint64(pwp.pingCount, 1)
 	if prevPing > missedPings {
 		return errors.New("connection is dead")
 	}
-	if _, err := w.Write([]byte{0x00}); err != nil {
+	if _, err := pwp.peerIO.Write([]byte{0x00}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (pwp *peerWriterPipeline) step01WriteMessage(w io.Writer, msg []byte) error {
+func (pwp *peerWriterPipeline) step01WriteMessage(msg []byte) error {
 	varintBuf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(varintBuf, uint64(len(msg)))
-	if _, err := w.Write(varintBuf[:n]); err != nil {
+	if _, err := pwp.peerIO.Write(varintBuf[:n]); err != nil {
 		return err
 	}
-	if _, err := w.Write(msg); err != nil {
+	if _, err := pwp.peerIO.Write(msg); err != nil {
 		return err
 	}
 	return nil
-}
-
-func (pwp *peerWriterPipeline) drainWriteBytes(r io.Reader) error {
-	_, err := pwp.peerIO.ReadFrom(r)
-	return errors.WithStack(err)
 }
 
 type peerID uint64
@@ -580,9 +546,4 @@ type receivedMessage struct {
 	Buffer []byte
 	Size   uint64
 	Hash   uint64
-}
-
-type step01Reader interface {
-	io.Reader
-	io.ByteReader
 }
