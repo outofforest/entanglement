@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cespare/xxhash/v2"
@@ -200,18 +200,21 @@ func BenchmarkMemory(b *testing.B) {
 		messages = append(messages, msg)
 	}
 
+	sendCh := make(chan []byte, nMessages)
+	for i := 0; i < nMessages; i++ {
+		msg := make([]byte, msgSize)
+		_, err := rand.Read(msg)
+		requireT.NoError(err)
+		sendCh <- msg
+	}
+
 	ctx, cancel := context.WithCancel(logger.WithLogger(context.Background(), logger.New(logger.DefaultConfig)))
 	b.Cleanup(cancel)
 
-	var mu sync.Mutex
-	received := make([][]byte, 0, 10*nMessages)
+	received := new(uint64)
 	eDoneCh := make(chan struct{})
-	e := New(peerCh, nil, func(ctx context.Context, msg []byte, hash uint64) error {
-		mu.Lock()
-		defer mu.Unlock()
-
-		received = append(received, msg)
-		if len(received) == nMessages {
+	e := New(peerCh, sendCh, func(ctx context.Context, msg []byte, hash uint64) error {
+		if atomic.AddUint64(received, 1) == nMessages {
 			close(eDoneCh)
 		}
 		return nil
