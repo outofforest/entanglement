@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"io"
 	"testing"
 
 	"github.com/outofforest/logger"
@@ -30,8 +29,12 @@ func (p *peerIO) Read(b []byte) (int, error) {
 	return p.ReadData.Read(b)
 }
 
-func (p *peerIO) ReadFrom(r io.Reader) (int64, error) {
-	return p.WriteData.ReadFrom(r)
+func (p *peerIO) Write(b []byte) (int, error) {
+	return p.WriteData.Write(b)
+}
+
+func (p *peerIO) ReadByte() (byte, error) {
+	return p.ReadData.ReadByte()
 }
 
 func (p *peerIO) Close() error {
