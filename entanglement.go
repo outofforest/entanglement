@@ -126,7 +126,7 @@ func newPeer(
 	return &peer{
 		peerIO:         peerIO,
 		readerPipeline: newPeerReaderPipeline(peerID, peerIO, msgHandler, peers, dedup, pingCount),
-		writerPipeline: newPeerWriterPipeline(peerID, peerIO, sendCh, pingCount),
+		writerPipeline: newPeerWriterPipeline(peerID, peerIO, sendCh, dedup, pingCount),
 	}
 }
 
@@ -377,6 +377,7 @@ type peerWriterPipeline struct {
 	peerID peerID
 	peerIO PeerIO
 	sendCh <-chan []byte
+	dedup  *dedupCache
 
 	pingCount *uint64
 }
@@ -385,36 +386,86 @@ func newPeerWriterPipeline(
 	peerID peerID,
 	peerIO PeerIO,
 	sendCh <-chan []byte,
+	dedup *dedupCache,
 	pingCount *uint64,
 ) *peerWriterPipeline {
 	return &peerWriterPipeline{
 		peerID:    peerID,
 		peerIO:    peerIO,
 		sendCh:    sendCh,
+		dedup:     dedup,
 		pingCount: pingCount,
 	}
 }
 
 func (pwp *peerWriterPipeline) Run(ctx context.Context) error {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
+	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
 
-	for {
-		ticker.Reset(pingInterval)
+		ch01To02 := make(chan sendMessage, 10)
+		ch02To03 := make(chan []byte, 10)
 
-		select {
-		case <-ctx.Done():
-			return errors.WithStack(ctx.Err())
-		case msg := <-pwp.sendCh:
-			if err := pwp.step01WriteMessage(msg); err != nil {
-				return err
+		spawn("step01HashMessage", parallel.Fail, func(ctx context.Context) error {
+			var msg []byte
+
+			for {
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case msg = <-pwp.sendCh:
+				}
+
+				sendMsg := pwp.step01HashMessage(msg)
+
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case ch01To02 <- sendMsg:
+				}
 			}
-		case <-ticker.C:
-			if err := pwp.ping(); err != nil {
-				return err
+		})
+		spawn("step02SetDedups", parallel.Fail, func(ctx context.Context) error {
+			var msg []byte
+			var sendMsg sendMessage
+
+			for {
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case sendMsg = <-ch01To02:
+				}
+
+				msg = pwp.step02SetDedup(sendMsg)
+
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case ch02To03 <- msg:
+				}
 			}
-		}
-	}
+		})
+		spawn("step03WriteMessages", parallel.Fail, func(ctx context.Context) error {
+			for {
+				ticker.Reset(pingInterval)
+
+				select {
+				case <-ctx.Done():
+					return errors.WithStack(ctx.Err())
+				case msg := <-ch02To03:
+					if err := pwp.step03WriteMessage(msg); err != nil {
+						return err
+					}
+				case <-ticker.C:
+					if err := pwp.ping(); err != nil {
+						return err
+					}
+				}
+			}
+		})
+
+		return nil
+	})
 }
 
 func (pwp *peerWriterPipeline) ping() error {
@@ -429,7 +480,19 @@ func (pwp *peerWriterPipeline) ping() error {
 	return nil
 }
 
-func (pwp *peerWriterPipeline) step01WriteMessage(msg []byte) error {
+func (pwp *peerWriterPipeline) step01HashMessage(msg []byte) sendMessage {
+	return sendMessage{
+		Message: msg,
+		Hash:    xxhash.Sum64(msg),
+	}
+}
+
+func (pwp *peerWriterPipeline) step02SetDedup(msg sendMessage) []byte {
+	pwp.dedup.Check(msg.Hash)
+	return msg.Message
+}
+
+func (pwp *peerWriterPipeline) step03WriteMessage(msg []byte) error {
 	varintBuf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(varintBuf, uint64(len(msg)))
 	if _, err := pwp.peerIO.Write(varintBuf[:n]); err != nil {
@@ -546,4 +609,9 @@ type receivedMessage struct {
 	Buffer []byte
 	Size   uint64
 	Hash   uint64
+}
+
+type sendMessage struct {
+	Message []byte
+	Hash    uint64
 }
