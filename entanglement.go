@@ -419,7 +419,7 @@ func (pwp *peerWriterPipeline) Run(ctx context.Context) error {
 				if msg == nil {
 					if err := pwp.ping(); err != nil {
 						reportError(err, pwp.errCh)
-						//break
+						break
 					}
 				} else {
 					if err := pwp.step03WriteMessage(msg); err != nil {
