@@ -195,8 +195,6 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 		ch01To02 := make(chan receivedMessage, 10)
 		ch02To03 := make(chan receivedMessage, 10)
 		ch03To04 := make(chan receivedMessage, 10)
-		ch04To05 := make(chan receivedMessage, 10)
-		ch05To06 := make(chan []byte, 10)
 
 		spawn("step01ReceiveMessages", parallel.Fail, func(ctx context.Context) error {
 			defer close(ch01To02)
@@ -231,36 +229,19 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 
 			return errors.WithStack(ctx.Err())
 		})
-		spawn("step04CopyMessages", parallel.Fail, func(ctx context.Context) error {
-			defer close(ch04To05)
-
+		spawn("step04HandleMessages", parallel.Fail, func(ctx context.Context) error {
 			var buffer []byte
+			var msgBytes []byte
 			for msg := range ch03To04 {
-				msg.Buffer, buffer = prp.step04CopyMessage(msg, buffer, messageBufferPool)
-				ch04To05 <- msg
-			}
-
-			return errors.WithStack(ctx.Err())
-		})
-		spawn("step05HandleMessages", parallel.Fail, func(ctx context.Context) error {
-			defer close(ch05To06)
-
-			for msg := range ch04To05 {
-				if err := prp.step05HandleMessage(ctx, msg.Buffer, msg.Hash); err != nil {
+				if err := prp.step04HandleMessage(ctx, msg.Buffer[:msg.Size], msg.Hash); err != nil {
 					reportError(err, prp.errCh)
 					break
 				}
-				ch05To06 <- msg.Buffer
+				msgBytes, buffer = prp.step04CopyMessage(msg, buffer, messageBufferPool)
+				prp.step04BroadcastMessage(msgBytes)
 			}
 
-			for range ch04To05 {
-			}
-
-			return errors.WithStack(ctx.Err())
-		})
-		spawn("step06BroadcastMessages", parallel.Fail, func(ctx context.Context) error {
-			for msg := range ch05To06 {
-				prp.step06BroadcastMessage(msg)
+			for range ch03To04 {
 			}
 
 			return errors.WithStack(ctx.Err())
@@ -335,11 +316,11 @@ func (prp *peerReaderPipeline) step04CopyMessage(msg receivedMessage, buffer []b
 	return buffer[:msg.Size], buffer[msg.Size:]
 }
 
-func (prp *peerReaderPipeline) step06BroadcastMessage(msg []byte) {
+func (prp *peerReaderPipeline) step04BroadcastMessage(msg []byte) {
 	prp.peers.Broadcast(prp.peerID, msg)
 }
 
-func (prp *peerReaderPipeline) step05HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
+func (prp *peerReaderPipeline) step04HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
 	return prp.msgHandler(ctx, msg, hash)
 }
 
