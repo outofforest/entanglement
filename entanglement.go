@@ -196,7 +196,7 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 		ch02To03 := make(chan receivedMessage, 10)
 		ch03To04 := make(chan receivedMessage, 10)
 		ch04To05 := make(chan receivedMessage, 10)
-		ch05To06 := make(chan receivedMessage, 10)
+		ch05To06 := make(chan []byte, 10)
 
 		spawn("step01ReceiveMessages", parallel.Fail, func(ctx context.Context) error {
 			defer close(ch01To02)
@@ -242,25 +242,25 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 
 			return errors.WithStack(ctx.Err())
 		})
-		spawn("step05BroadcastMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step05HandleMessages", parallel.Fail, func(ctx context.Context) error {
 			defer close(ch05To06)
 
 			for msg := range ch04To05 {
-				prp.step05BroadcastMessage(msg.Buffer)
-				ch05To06 <- msg
+				if err := prp.step05HandleMessage(ctx, msg.Buffer, msg.Hash); err != nil {
+					reportError(err, prp.errCh)
+					break
+				}
+				ch05To06 <- msg.Buffer
+			}
+
+			for range ch04To05 {
 			}
 
 			return errors.WithStack(ctx.Err())
 		})
-		spawn("step06HandleMessages", parallel.Fail, func(ctx context.Context) error {
+		spawn("step06BroadcastMessages", parallel.Fail, func(ctx context.Context) error {
 			for msg := range ch05To06 {
-				if err := prp.step06HandleMessage(ctx, msg.Buffer, msg.Hash); err != nil {
-					reportError(err, prp.errCh)
-					break
-				}
-			}
-
-			for range ch05To06 {
+				prp.step06BroadcastMessage(msg)
 			}
 
 			return errors.WithStack(ctx.Err())
@@ -335,11 +335,11 @@ func (prp *peerReaderPipeline) step04CopyMessage(msg receivedMessage, buffer []b
 	return buffer[:msg.Size], buffer[msg.Size:]
 }
 
-func (prp *peerReaderPipeline) step05BroadcastMessage(msg []byte) {
+func (prp *peerReaderPipeline) step06BroadcastMessage(msg []byte) {
 	prp.peers.Broadcast(prp.peerID, msg)
 }
 
-func (prp *peerReaderPipeline) step06HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
+func (prp *peerReaderPipeline) step05HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
 	return prp.msgHandler(ctx, msg, hash)
 }
 
