@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/outofforest/logger"
 	"github.com/outofforest/parallel"
 	"github.com/outofforest/spin"
@@ -58,6 +59,10 @@ func addMessages(requireT *require.Assertions, msgs ...[]byte) *bytes.Buffer {
 	return result
 }
 
+func hashingFunc(msg []byte) uint64 {
+	return xxhash.Sum64(msg)
+}
+
 func TestThreeSimpleTalkers(t *testing.T) {
 	requireT := require.New(t)
 
@@ -88,7 +93,7 @@ func TestThreeSimpleTalkers(t *testing.T) {
 	peerCh <- peer3
 
 	receivedCh := make(chan []byte, 6)
-	e := New(peerCh, nil, func(ctx context.Context, msg []byte, hash uint64) error {
+	e := New[uint64](peerCh, nil, hashingFunc, func(ctx context.Context, msg []byte, hash uint64) error {
 		receivedCh <- msg
 		return nil
 	})
