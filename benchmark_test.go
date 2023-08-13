@@ -213,7 +213,7 @@ func BenchmarkMemory(b *testing.B) {
 
 	received := new(uint64)
 	eDoneCh := make(chan struct{})
-	e := New(peerCh, sendCh, func(ctx context.Context, msg []byte, hash uint64) error {
+	e := New[uint64](peerCh, sendCh, hashingFunc, func(ctx context.Context, msg []byte, hash uint64) error {
 		if atomic.AddUint64(received, 1) == nMessages {
 			close(eDoneCh)
 		}

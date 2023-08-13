@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/outofforest/logger"
 	"github.com/outofforest/parallel"
 	"github.com/pkg/errors"
@@ -25,8 +24,11 @@ const (
 	maxDedupSize = 1000
 )
 
-// MessageHandler defines the function handling received messages.
-type MessageHandler func(ctx context.Context, msg []byte, hash uint64) error
+// HashingFunc computes hash of the message.
+type HashingFunc[THash comparable] func(msg []byte) THash
+
+// HandlerFunc defines the function handling received messages.
+type HandlerFunc[THash comparable] func(ctx context.Context, msg []byte, hash THash) error
 
 // PeerIO specifies the interface required from connected peers.
 type PeerIO interface {
@@ -37,36 +39,39 @@ type PeerIO interface {
 }
 
 // Entanglement broadcasts messages between peers.
-type Entanglement struct {
-	peerCh     <-chan PeerIO
-	sendCh     <-chan []byte
-	msgHandler MessageHandler
-	peers      *peerSet
-	dedup      *dedupCache
+type Entanglement[THash comparable] struct {
+	peerCh      <-chan PeerIO
+	sendCh      <-chan []byte
+	hashingFunc HashingFunc[THash]
+	msgHandler  HandlerFunc[THash]
+	peers       *peerSet
+	dedup       *dedupCache[THash]
 }
 
 // New creates new entanglement.
-func New(
+func New[THash comparable](
 	peerCh <-chan PeerIO,
 	sendCh <-chan []byte,
-	msgHandler MessageHandler,
-) *Entanglement {
-	return &Entanglement{
-		peerCh:     peerCh,
-		sendCh:     sendCh,
-		msgHandler: msgHandler,
-		peers:      newPeerSet(),
-		dedup:      newDedupCache(),
+	hashingFunc HashingFunc[THash],
+	msgHandler HandlerFunc[THash],
+) *Entanglement[THash] {
+	return &Entanglement[THash]{
+		peerCh:      peerCh,
+		sendCh:      sendCh,
+		hashingFunc: hashingFunc,
+		msgHandler:  msgHandler,
+		peers:       newPeerSet(),
+		dedup:       newDedupCache[THash](),
 	}
 }
 
 // ClearCache removes hash from the deduplication cache.
-func (e *Entanglement) ClearCache(hash uint64) {
+func (e *Entanglement[THash]) ClearCache(hash THash) {
 	e.dedup.Remove(hash)
 }
 
 // Run runs the entanglement.
-func (e *Entanglement) Run(ctx context.Context) error {
+func (e *Entanglement[THash]) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
 		spawn("broadcast", parallel.Fail, func(ctx context.Context) error {
 			for {
@@ -91,7 +96,7 @@ func (e *Entanglement) Run(ctx context.Context) error {
 					peerID := e.peers.Add(sendCh)
 
 					spawn(fmt.Sprintf("peer-%d", peerID), parallel.Continue, func(ctx context.Context) error {
-						peer := newPeer(peerID, peerIO, sendCh, e.msgHandler, e.peers, e.dedup)
+						peer := newPeer(peerID, peerIO, e.hashingFunc, sendCh, e.msgHandler, e.peers, e.dedup)
 						if err := peer.Run(ctx); err != nil {
 							logger.Get(ctx).Error("Peer failed", zap.Error(err))
 						}
@@ -105,36 +110,37 @@ func (e *Entanglement) Run(ctx context.Context) error {
 	})
 }
 
-type peer struct {
+type peer[THash comparable] struct {
 	peerID         peerID
 	peerIO         PeerIO
-	readerPipeline *peerReaderPipeline
-	writerPipeline *peerWriterPipeline
+	readerPipeline *peerReaderPipeline[THash]
+	writerPipeline *peerWriterPipeline[THash]
 
 	errCh <-chan error
 }
 
-func newPeer(
+func newPeer[THash comparable](
 	peerID peerID,
 	peerIO PeerIO,
+	hashingFunc HashingFunc[THash],
 	sendCh <-chan []byte,
-	msgHandler MessageHandler,
+	msgHandler HandlerFunc[THash],
 	peers *peerSet,
-	dedup *dedupCache,
+	dedup *dedupCache[THash],
 
-) *peer {
+) *peer[THash] {
 	errCh := make(chan error, 1)
 	pingTime := new(uint64)
-	return &peer{
+	return &peer[THash]{
 		peerID:         peerID,
 		peerIO:         peerIO,
-		readerPipeline: newPeerReaderPipeline(peerID, peerIO, msgHandler, peers, dedup, errCh, pingTime),
-		writerPipeline: newPeerWriterPipeline(peerID, peerIO, sendCh, peers, dedup, errCh, pingTime),
+		readerPipeline: newPeerReaderPipeline[THash](peerID, peerIO, hashingFunc, msgHandler, peers, dedup, errCh, pingTime),
+		writerPipeline: newPeerWriterPipeline[THash](peerID, peerIO, hashingFunc, sendCh, peers, dedup, errCh, pingTime),
 		errCh:          errCh,
 	}
 }
 
-func (p *peer) Run(ctx context.Context) error {
+func (p *peer[THash]) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
 		spawn("closer", parallel.Fail, func(ctx context.Context) error {
 			var err error
@@ -154,47 +160,50 @@ func (p *peer) Run(ctx context.Context) error {
 	})
 }
 
-type peerReaderPipeline struct {
-	peerID     peerID
-	peerIO     PeerIO
-	msgHandler MessageHandler
-	peers      *peerSet
-	dedup      *dedupCache
+type peerReaderPipeline[THash comparable] struct {
+	peerID      peerID
+	peerIO      PeerIO
+	hashingFunc HashingFunc[THash]
+	msgHandler  HandlerFunc[THash]
+	peers       *peerSet
+	dedup       *dedupCache[THash]
 
 	errCh    chan<- error
 	pingTime *uint64
 }
 
-func newPeerReaderPipeline(
+func newPeerReaderPipeline[THash comparable](
 	peerID peerID,
 	peerIO PeerIO,
-	msgHandler MessageHandler,
+	hashingFunc HashingFunc[THash],
+	msgHandler HandlerFunc[THash],
 	peers *peerSet,
-	dedup *dedupCache,
+	dedup *dedupCache[THash],
 	errCh chan<- error,
 	pingTime *uint64,
-) *peerReaderPipeline {
-	return &peerReaderPipeline{
-		peerID:     peerID,
-		peerIO:     peerIO,
-		msgHandler: msgHandler,
-		peers:      peers,
-		dedup:      dedup,
-		errCh:      errCh,
-		pingTime:   pingTime,
+) *peerReaderPipeline[THash] {
+	return &peerReaderPipeline[THash]{
+		peerID:      peerID,
+		peerIO:      peerIO,
+		hashingFunc: hashingFunc,
+		msgHandler:  msgHandler,
+		peers:       peers,
+		dedup:       dedup,
+		errCh:       errCh,
+		pingTime:    pingTime,
 	}
 }
 
-func (prp *peerReaderPipeline) Run(ctx context.Context) error {
+func (prp *peerReaderPipeline[THash]) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
 		messageBufferPool := make(chan []byte, 10)
 		for i := 0; i < cap(messageBufferPool); i++ {
 			messageBufferPool <- make([]byte, 4096)
 		}
 
-		ch01To02 := make(chan receivedMessage, 10)
-		ch02To03 := make(chan receivedMessage, 10)
-		ch03To04 := make(chan receivedMessage, 10)
+		ch01To02 := make(chan receivedMessage[THash], 10)
+		ch02To03 := make(chan receivedMessage[THash], 10)
+		ch03To04 := make(chan receivedMessage[THash], 10)
 
 		spawn("step01ReceiveMessages", parallel.Fail, func(ctx context.Context) error {
 			defer close(ch01To02)
@@ -250,20 +259,20 @@ func (prp *peerReaderPipeline) Run(ctx context.Context) error {
 	})
 }
 
-func (prp *peerReaderPipeline) step01ReceiveMessage(messageBufferPool chan []byte) (retRecvMsg receivedMessage, retOK bool, retErr error) {
+func (prp *peerReaderPipeline[THash]) step01ReceiveMessage(messageBufferPool chan []byte) (retRecvMsg receivedMessage[THash], retOK bool, retErr error) {
 	msgSize, err := binary.ReadUvarint(prp.peerIO)
 	if err != nil {
-		return receivedMessage{}, false, errors.WithStack(err)
+		return receivedMessage[THash]{}, false, errors.WithStack(err)
 	}
 
 	atomic.StoreUint64(prp.pingTime, uint64(time.Now().Unix()))
 
 	if msgSize == 0 {
-		return receivedMessage{}, false, nil
+		return receivedMessage[THash]{}, false, nil
 	}
 
 	if msgSize > maxMsgSize {
-		return receivedMessage{}, false, errors.Errorf("message is too big: %d bytes, but %d is the maximum", msgSize, maxMsgSize)
+		return receivedMessage[THash]{}, false, errors.Errorf("message is too big: %d bytes, but %d is the maximum", msgSize, maxMsgSize)
 	}
 
 	messageBuffer := <-messageBufferPool
@@ -280,23 +289,23 @@ func (prp *peerReaderPipeline) step01ReceiveMessage(messageBufferPool chan []byt
 	for nTotal < msgSize {
 		n, err := prp.peerIO.Read(messageBuffer[nTotal:msgSize])
 		if err != nil {
-			return receivedMessage{}, false, err
+			return receivedMessage[THash]{}, false, err
 		}
 		nTotal += uint64(n)
 	}
 
-	return receivedMessage{
+	return receivedMessage[THash]{
 		Buffer: messageBuffer,
 		Size:   msgSize,
 	}, true, nil
 }
 
-func (prp *peerReaderPipeline) step02HashMessage(msg receivedMessage) receivedMessage {
-	msg.Hash = xxhash.Sum64(msg.Buffer[:msg.Size])
+func (prp *peerReaderPipeline[THash]) step02HashMessage(msg receivedMessage[THash]) receivedMessage[THash] {
+	msg.Hash = prp.hashingFunc(msg.Buffer[:msg.Size])
 	return msg
 }
 
-func (prp *peerReaderPipeline) step03DedupMessage(msg receivedMessage, messageBufferPool chan []byte) bool {
+func (prp *peerReaderPipeline[THash]) step03DedupMessage(msg receivedMessage[THash], messageBufferPool chan []byte) bool {
 	if prp.dedup.Check(msg.Hash) {
 		messageBufferPool <- msg.Buffer
 		return false
@@ -305,7 +314,7 @@ func (prp *peerReaderPipeline) step03DedupMessage(msg receivedMessage, messageBu
 	return true
 }
 
-func (prp *peerReaderPipeline) step04CopyMessage(msg receivedMessage, buffer []byte, messageBufferPool chan []byte) ([]byte, []byte) {
+func (prp *peerReaderPipeline[THash]) step04CopyMessage(msg receivedMessage[THash], buffer []byte, messageBufferPool chan []byte) ([]byte, []byte) {
 	if uint64(len(buffer)) < msg.Size {
 		buffer = make([]byte, 2*maxMsgSize)
 	}
@@ -316,48 +325,51 @@ func (prp *peerReaderPipeline) step04CopyMessage(msg receivedMessage, buffer []b
 	return buffer[:msg.Size], buffer[msg.Size:]
 }
 
-func (prp *peerReaderPipeline) step04BroadcastMessage(msg []byte) {
+func (prp *peerReaderPipeline[THash]) step04BroadcastMessage(msg []byte) {
 	prp.peers.Broadcast(prp.peerID, msg)
 }
 
-func (prp *peerReaderPipeline) step04HandleMessage(ctx context.Context, msg []byte, hash uint64) error {
+func (prp *peerReaderPipeline[THash]) step04HandleMessage(ctx context.Context, msg []byte, hash THash) error {
 	return prp.msgHandler(ctx, msg, hash)
 }
 
-type peerWriterPipeline struct {
-	peerID peerID
-	peerIO PeerIO
-	sendCh <-chan []byte
-	peers  *peerSet
-	dedup  *dedupCache
+type peerWriterPipeline[THash comparable] struct {
+	peerID      peerID
+	peerIO      PeerIO
+	hashingFunc HashingFunc[THash]
+	sendCh      <-chan []byte
+	peers       *peerSet
+	dedup       *dedupCache[THash]
 
 	errCh    chan<- error
 	pingTime *uint64
 }
 
-func newPeerWriterPipeline(
+func newPeerWriterPipeline[THash comparable](
 	peerID peerID,
 	peerIO PeerIO,
+	hashingFunc HashingFunc[THash],
 	sendCh <-chan []byte,
 	peers *peerSet,
-	dedup *dedupCache,
+	dedup *dedupCache[THash],
 	errCh chan<- error,
 	pingTime *uint64,
-) *peerWriterPipeline {
-	return &peerWriterPipeline{
-		peerID:   peerID,
-		peerIO:   peerIO,
-		sendCh:   sendCh,
-		peers:    peers,
-		dedup:    dedup,
-		errCh:    errCh,
-		pingTime: pingTime,
+) *peerWriterPipeline[THash] {
+	return &peerWriterPipeline[THash]{
+		peerID:      peerID,
+		peerIO:      peerIO,
+		hashingFunc: hashingFunc,
+		sendCh:      sendCh,
+		peers:       peers,
+		dedup:       dedup,
+		errCh:       errCh,
+		pingTime:    pingTime,
 	}
 }
 
-func (pwp *peerWriterPipeline) Run(ctx context.Context) error {
+func (pwp *peerWriterPipeline[THash]) Run(ctx context.Context) error {
 	return parallel.Run(ctx, func(ctx context.Context, spawn parallel.SpawnFn) error {
-		ch01To02 := make(chan sendMessage, 10)
+		ch01To02 := make(chan sendMessage[THash], 10)
 		ch02To03 := make(chan []byte, 10)
 
 		spawn("closer", parallel.Fail, func(ctx context.Context) error {
@@ -420,7 +432,7 @@ func (pwp *peerWriterPipeline) Run(ctx context.Context) error {
 	})
 }
 
-func (pwp *peerWriterPipeline) ping() error {
+func (pwp *peerWriterPipeline[THash]) ping() error {
 	pingTime := atomic.LoadUint64(pwp.pingTime)
 	if uint64(time.Now().Unix())-pingTime > missedPings*uint64(pingInterval/time.Second) {
 		return errors.New("connection is dead")
@@ -432,19 +444,19 @@ func (pwp *peerWriterPipeline) ping() error {
 	return nil
 }
 
-func (pwp *peerWriterPipeline) step01HashMessage(msg []byte) sendMessage {
-	return sendMessage{
+func (pwp *peerWriterPipeline[THash]) step01HashMessage(msg []byte) sendMessage[THash] {
+	return sendMessage[THash]{
 		Message: msg,
-		Hash:    xxhash.Sum64(msg),
+		Hash:    pwp.hashingFunc(msg),
 	}
 }
 
-func (pwp *peerWriterPipeline) step02SetDedup(msg sendMessage) []byte {
+func (pwp *peerWriterPipeline[THash]) step02SetDedup(msg sendMessage[THash]) []byte {
 	pwp.dedup.Check(msg.Hash)
 	return msg.Message
 }
 
-func (pwp *peerWriterPipeline) step03WriteMessage(msg []byte) error {
+func (pwp *peerWriterPipeline[THash]) step03WriteMessage(msg []byte) error {
 	varintBuf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(varintBuf, uint64(len(msg)))
 	if _, err := pwp.peerIO.Write(varintBuf[:n]); err != nil {
@@ -508,20 +520,20 @@ func (ps *peerSet) Broadcast(senderID peerID, msg []byte) {
 	}
 }
 
-type dedupCache struct {
+type dedupCache[THash comparable] struct {
 	mu     sync.RWMutex
-	dedup1 map[uint64]struct{}
-	dedup2 map[uint64]struct{}
+	dedup1 map[THash]struct{}
+	dedup2 map[THash]struct{}
 }
 
-func newDedupCache() *dedupCache {
-	return &dedupCache{
-		dedup1: make(map[uint64]struct{}, maxDedupSize),
-		dedup2: make(map[uint64]struct{}, maxDedupSize),
+func newDedupCache[THash comparable]() *dedupCache[THash] {
+	return &dedupCache[THash]{
+		dedup1: make(map[THash]struct{}, maxDedupSize),
+		dedup2: make(map[THash]struct{}, maxDedupSize),
 	}
 }
 
-func (dc *dedupCache) Check(hash uint64) bool {
+func (dc *dedupCache[THash]) Check(hash THash) bool {
 	exists := func() bool {
 		dc.mu.RLock()
 		defer dc.mu.RUnlock()
@@ -542,7 +554,7 @@ func (dc *dedupCache) Check(hash uint64) bool {
 
 	if len(dc.dedup1) == maxDedupSize {
 		dc.dedup1 = dc.dedup2
-		dc.dedup2 = make(map[uint64]struct{}, maxDedupSize)
+		dc.dedup2 = make(map[THash]struct{}, maxDedupSize)
 	}
 	dc.dedup1[hash] = struct{}{}
 	if len(dc.dedup1) > maxDedupSize/2 {
@@ -552,7 +564,7 @@ func (dc *dedupCache) Check(hash uint64) bool {
 	return false
 }
 
-func (dc *dedupCache) Remove(hash uint64) {
+func (dc *dedupCache[THash]) Remove(hash THash) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 
@@ -560,15 +572,15 @@ func (dc *dedupCache) Remove(hash uint64) {
 	delete(dc.dedup2, hash)
 }
 
-type receivedMessage struct {
+type receivedMessage[THash comparable] struct {
 	Buffer []byte
 	Size   uint64
-	Hash   uint64
+	Hash   THash
 }
 
-type sendMessage struct {
+type sendMessage[THash comparable] struct {
 	Message []byte
-	Hash    uint64
+	Hash    THash
 }
 
 func reportError(err error, errCh chan<- error) {
