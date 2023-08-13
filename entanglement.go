@@ -505,6 +505,8 @@ func (ps *peerSet) Delete(pID peerID) {
 }
 
 func (ps *peerSet) Broadcast(senderID peerID, msg []byte) {
+	// TODO (wojciech): when broadcasting received messages, send them only to peers we haven't received the same message from so far
+
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
@@ -534,6 +536,8 @@ func newDedupCache[THash comparable]() *dedupCache[THash] {
 }
 
 func (dc *dedupCache[THash]) Check(hash THash) bool {
+	// TODO (wojciech): Try to improve parallelism
+
 	exists := func() bool {
 		dc.mu.RLock()
 		defer dc.mu.RUnlock()
