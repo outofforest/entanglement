@@ -3,7 +3,7 @@ module github.com/outofforest/entanglement
 go 1.20
 
 require (
-	github.com/cespare/xxhash/v2 v2.2.0
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/outofforest/logger v0.4.0
 	github.com/outofforest/parallel v0.2.3
 	github.com/outofforest/spin v0.2.0
